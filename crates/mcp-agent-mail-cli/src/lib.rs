@@ -578,8 +578,8 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
         /// Return events strictly after this cursor.
-        #[arg(long, default_value_t = 0)]
-        after: i64,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        after: Option<i64>,
         /// Maximum events per page (1..=1000).
         #[arg(long, default_value_t = 100)]
         limit: usize,
@@ -591,7 +591,7 @@ pub enum Commands {
         )]
         wait: u64,
         /// Return the current recipient position without historical events.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "after")]
         position_now: bool,
         /// Emit machine-readable JSON.
         #[arg(long, default_value_t = true)]
@@ -7401,12 +7401,13 @@ const fn check_inbox_should_use_daemon(direct: bool, daemon_reachable: bool) -> 
 fn handle_inbox_events(
     agent: Option<String>,
     project: Option<String>,
-    after: i64,
+    after: Option<i64>,
     limit: usize,
     wait_seconds: u64,
     position_now: bool,
     json: bool,
 ) -> CliResult<()> {
+    let after = after.unwrap_or(0);
     if wait_seconds > 3600 {
         return Err(CliError::InvalidArgument(
             "inbox-events --wait must be between 0 and 3600 seconds".to_string(),
@@ -7425,11 +7426,6 @@ fn handle_inbox_events(
     if !(1..=1000).contains(&limit) {
         return Err(CliError::InvalidArgument(
             "inbox-events --limit must be between 1 and 1000".to_string(),
-        ));
-    }
-    if position_now && after != 0 {
-        return Err(CliError::InvalidArgument(
-            "inbox-events --position-now cannot be combined with a nonzero --after".to_string(),
         ));
     }
     let agent_name = agent
@@ -40195,7 +40191,7 @@ http_headers = { Authorization = "Bearer secret" }
             } => {
                 assert_eq!(project.as_deref(), Some("/tmp/project"));
                 assert_eq!(agent.as_deref(), Some("BlueLake"));
-                assert_eq!(after, 41);
+                assert_eq!(after, Some(41));
                 assert_eq!(limit, 250);
                 assert_eq!(wait, 10);
                 assert!(!position_now);
@@ -40210,6 +40206,13 @@ http_headers = { Authorization = "Bearer secret" }
         let error = Cli::try_parse_from(["am", "inbox-events", "--wait", "3601"])
             .expect_err("waits over one hour must be rejected");
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn clap_rejects_position_now_with_after_even_at_zero() {
+        let error = Cli::try_parse_from(["am", "inbox-events", "--position-now", "--after", "0"])
+            .expect_err("position-now and after describe different cursor operations");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
