@@ -11,6 +11,94 @@ use sqlmodel_core::Value;
 
 const MAX_SYNC_IN_CLAUSE_ITEMS: usize = 500;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InboxDeliveryEvent {
+    pub seq: i64,
+    pub message_id: i64,
+}
+
+/// Return durable recipient deliveries strictly after `after`, oldest first.
+pub fn fetch_inbox_events_from_conn(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    after: i64,
+    limit: usize,
+) -> Result<Vec<InboxDeliveryEvent>, DbError> {
+    if after < 0 {
+        return Err(DbError::invalid("after", "cursor must be non-negative"));
+    }
+    if limit == 0 {
+        return Err(DbError::invalid("limit", "limit must be positive"));
+    }
+    let limit =
+        i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
+    let rows = conn
+        .query_sync(
+            "SELECT seq, message_id FROM inbox_delivery_events \
+             WHERE agent_id = ? AND project_id = ? AND seq > ? \
+             ORDER BY seq ASC LIMIT ?",
+            &[
+                Value::BigInt(agent_id),
+                Value::BigInt(project_id),
+                Value::BigInt(after),
+                Value::BigInt(limit),
+            ],
+        )
+        .map_err(|e| DbError::Sqlite(e.to_string()))?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(InboxDeliveryEvent {
+                seq: row
+                    .get_named("seq")
+                    .map_err(|e| DbError::Sqlite(e.to_string()))?,
+                message_id: row
+                    .get_named("message_id")
+                    .map_err(|e| DbError::Sqlite(e.to_string()))?,
+            })
+        })
+        .collect()
+}
+
+/// Return the newest durable recipient delivery cursor, or zero for no mail.
+pub fn inbox_event_position_from_conn(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+) -> Result<i64, DbError> {
+    let rows = conn
+        .query_sync(
+            "SELECT COALESCE(MAX(seq), 0) AS cursor FROM inbox_delivery_events \
+             WHERE agent_id = ? AND project_id = ?",
+            &[Value::BigInt(agent_id), Value::BigInt(project_id)],
+        )
+        .map_err(|e| DbError::Sqlite(e.to_string()))?;
+    rows.into_iter()
+        .next()
+        .ok_or_else(|| DbError::Sqlite("inbox event position query returned no row".to_string()))?
+        .get_named("cursor")
+        .map_err(|e| DbError::Sqlite(e.to_string()))
+}
+
+pub fn inbox_event_floor_from_conn(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+) -> Result<i64, DbError> {
+    let rows = conn
+        .query_sync(
+            "SELECT COALESCE(MAX(floor_seq), 0) AS floor FROM inbox_event_retention \
+             WHERE project_id = ? AND agent_id = ?",
+            &[Value::BigInt(project_id), Value::BigInt(agent_id)],
+        )
+        .map_err(|e| DbError::Sqlite(e.to_string()))?;
+    rows.into_iter()
+        .next()
+        .ok_or_else(|| DbError::Sqlite("inbox event floor query returned no row".to_string()))?
+        .get_named("floor")
+        .map_err(|e| DbError::Sqlite(e.to_string()))
+}
+
 /// Synchronously update the thread ID of a message.
 ///
 /// Returns `Ok(true)` if the thread ID was updated, `Ok(false)` if it was already the target ID.
@@ -981,6 +1069,93 @@ mod tests {
         assert!(
             metadata_rows[0].message.body_md.is_empty(),
             "metadata-only inbox reads should not materialize message bodies"
+        );
+    }
+
+    #[test]
+    fn inbox_events_are_recipient_scoped_oldest_first_and_cursor_paginated() {
+        let conn = test_conn();
+        let project_id = insert_project(&conn);
+        let sender_id = insert_agent(&conn, project_id, "Sender");
+        let recipient_id = insert_agent(&conn, project_id, "Recipient");
+        let other_id = insert_agent(&conn, project_id, "Other");
+        let first = insert_message(&conn, project_id, sender_id, "first");
+        let gap = insert_message(&conn, project_id, sender_id, "gap");
+        let second = insert_message(&conn, project_id, sender_id, "second");
+        for (message_id, agent_id) in [
+            (first, recipient_id),
+            (gap, other_id),
+            (second, recipient_id),
+        ] {
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, 'to')",
+                &[Value::BigInt(message_id), Value::BigInt(agent_id)],
+            )
+            .expect("insert recipient delivery");
+        }
+
+        assert_eq!(
+            fetch_inbox_events_from_conn(&conn, project_id, recipient_id, 0, 10)
+                .expect("first page"),
+            vec![
+                InboxDeliveryEvent {
+                    seq: 1,
+                    message_id: first
+                },
+                InboxDeliveryEvent {
+                    seq: 3,
+                    message_id: second
+                },
+            ]
+        );
+        assert_eq!(
+            fetch_inbox_events_from_conn(&conn, project_id, recipient_id, 1, 10)
+                .expect("cursor page"),
+            vec![InboxDeliveryEvent {
+                seq: 3,
+                message_id: second
+            }]
+        );
+        assert_eq!(
+            inbox_event_position_from_conn(&conn, project_id, recipient_id)
+                .expect("current position"),
+            3
+        );
+        assert!(
+            fetch_inbox_events_from_conn(&conn, project_id, other_id, 2, 10)
+                .expect("empty page")
+                .is_empty()
+        );
+        assert_eq!(
+            inbox_event_floor_from_conn(&conn, project_id, recipient_id).expect("retention floor"),
+            0
+        );
+        conn.execute_sync(
+            "DELETE FROM messages WHERE id = ?",
+            &[Value::BigInt(second)],
+        )
+        .expect("delete message after delivery");
+        assert_eq!(
+            fetch_inbox_events_from_conn(&conn, project_id, recipient_id, 1, 10)
+                .expect("event survives message deletion"),
+            vec![InboxDeliveryEvent {
+                seq: 3,
+                message_id: second
+            }]
+        );
+        conn.execute_sync(
+            "INSERT INTO inbox_event_retention (project_id, agent_id, floor_seq) VALUES (?, ?, ?)",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(recipient_id),
+                Value::BigInt(3),
+            ],
+        )
+        .expect("record retention floor");
+        assert_eq!(
+            inbox_event_floor_from_conn(&conn, project_id, recipient_id)
+                .expect("advanced retention floor"),
+            3
         );
     }
 

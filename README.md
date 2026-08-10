@@ -511,7 +511,7 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 
 | Surface | Subcommands / form | What it is for |
 |---------|--------------------|----------------|
-| Runtime | `serve-http`, `serve-stdio`, `service install|status|logs|restart`, `check-inbox` | Start the server, run stdio MCP, manage a background service, or poll inbox state from hooks/editors |
+| Runtime | `serve-http`, `serve-stdio`, `service install|status|logs|restart`, `check-inbox`, `inbox-events` | Start the server, run stdio MCP, manage a background service, poll unread state, or consume a durable delivery cursor |
 | Quality gates | `ci`, `verify`, `lint`, `typecheck`, `bench` | Run the native quality pipeline, build-slot-protected verification lanes, and CLI/perf baselines |
 | E2E and determinism | `e2e list|run|show`, `golden capture|verify|list`, `flake-triage scan|reproduce|detect` | Test transports and workflows, guard CLI output contracts, and triage flaky failures |
 | Share and deploy | `share export|update|preview|verify|decrypt|wizard|static-export`, `share deploy validate|tooling|verify|verify-live` | Build portable mailbox bundles, preview them, and validate live static deployments |
@@ -521,6 +521,25 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Platform and setup | `setup run|status`, `config set-port|show-port`, `amctl env`, `tooling ...`, `docs insert-blurbs` | Bootstrap connectors, inspect runtime config, introspect tool schemas/metrics/locks, and stamp docs |
 | Migration and lifecycle | `legacy detect|import|status`, `upgrade`, `migrate`, `self-update`, `am-run`, `guard ...` | Migrate Python installs, perform DB-format upgrades, run slot-aware build commands, and manage guard hooks |
 | Break-glass admin | `clear-and-reset-everything` | Fully reset local state after optional archival. Use sparingly. |
+
+### Durable inbox events
+
+Long-lived automation should use the non-consuming recipient delivery cursor,
+not repeated diffs of the bounded `check-inbox` view:
+
+```bash
+# Deliberately establish a fresh position without replaying history.
+am inbox-events --project "$PROJ" --agent "$AGENT_NAME" --position-now --json
+
+# Read oldest-first pages after a durable cursor; follow has_more immediately.
+am inbox-events --project "$PROJ" --agent "$AGENT_NAME" \
+  --after 123 --limit 1000 --wait 10 --json
+```
+
+The JSON contract returns `events`, `next_cursor`, and `has_more`. Event
+sequence and message ID are separate values. Empty success is always valid JSON.
+Errors are nonzero; `cursor_expired` requires an operator-approved rebaseline.
+Reading events never changes unread or acknowledgement state.
 
 ### Setup Drift Reports
 

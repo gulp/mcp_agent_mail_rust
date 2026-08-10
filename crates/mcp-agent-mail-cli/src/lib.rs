@@ -568,6 +568,35 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Read durable recipient delivery events after a monotonic cursor.
+    #[command(name = "inbox-events")]
+    InboxEvents {
+        /// Agent name (default: AGENT_MAIL_AGENT or AGENT_NAME).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Project key (default: AGENT_MAIL_PROJECT or current directory).
+        #[arg(long)]
+        project: Option<String>,
+        /// Return events strictly after this cursor.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        /// Maximum events per page (1..=1000).
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Wait up to this many seconds for an event (0 disables waiting).
+        #[arg(
+            long,
+            default_value_t = 0,
+            value_parser = clap::value_parser!(u64).range(0..=3600)
+        )]
+        wait: u64,
+        /// Return the current recipient position without historical events.
+        #[arg(long)]
+        position_now: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
     /// Run the unified local pre-release quality gate.
     #[command(name = "check")]
     Check {
@@ -3360,6 +3389,7 @@ fn command_is_read_only(command: &Commands) -> bool {
         | Commands::Thread { .. }
         | Commands::Health { .. }
         | Commands::CheckInbox { .. }
+        | Commands::InboxEvents { .. }
         | Commands::Status { .. }
         // `tui-dump` only reads `/mail/ws-state` over HTTP and (on fallback)
         // runs the read-only situational status builder — never mutates. It
@@ -3596,6 +3626,15 @@ fn execute(cli: Cli) -> CliResult<()> {
             port,
             project,
         } => handle_check_inbox(agent, rate_limit, direct, format, json, host, port, project),
+        Commands::InboxEvents {
+            agent,
+            project,
+            after,
+            limit,
+            wait,
+            json,
+            position_now,
+        } => handle_inbox_events(agent, project, after, limit, wait, position_now, json),
         Commands::Check {
             quick,
             report,
@@ -7359,6 +7398,143 @@ const fn check_inbox_should_use_daemon(direct: bool, daemon_reachable: bool) -> 
     !direct || daemon_reachable
 }
 
+fn handle_inbox_events(
+    agent: Option<String>,
+    project: Option<String>,
+    after: i64,
+    limit: usize,
+    wait_seconds: u64,
+    position_now: bool,
+    json: bool,
+) -> CliResult<()> {
+    if wait_seconds > 3600 {
+        return Err(CliError::InvalidArgument(
+            "inbox-events --wait must be between 0 and 3600 seconds".to_string(),
+        ));
+    }
+    if !json {
+        return Err(CliError::InvalidArgument(
+            "inbox-events currently requires --json".to_string(),
+        ));
+    }
+    if after < 0 {
+        return Err(CliError::InvalidArgument(
+            "inbox-events --after must be non-negative".to_string(),
+        ));
+    }
+    if !(1..=1000).contains(&limit) {
+        return Err(CliError::InvalidArgument(
+            "inbox-events --limit must be between 1 and 1000".to_string(),
+        ));
+    }
+    if position_now && after != 0 {
+        return Err(CliError::InvalidArgument(
+            "inbox-events --position-now cannot be combined with a nonzero --after".to_string(),
+        ));
+    }
+    let agent_name = agent
+        .or_else(|| std::env::var("AGENT_MAIL_AGENT").ok())
+        .or_else(|| std::env::var("AGENT_NAME").ok())
+        .ok_or_else(|| CliError::InvalidArgument("inbox-events requires an agent".to_string()))?;
+    let project_key = project
+        .or_else(|| std::env::var("AGENT_MAIL_PROJECT").ok())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default()
+        });
+
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    let read_db = open_db_sync_mail_inbox_with_database_url_and_path(&database_url)?;
+    let project_id = crate::context::resolve_project(read_db.conn(), &project_key)?.id;
+    let agent_id = resolve_agent_id_for_inbox_check(read_db.conn(), project_id, &agent_name)?;
+
+    let floor =
+        mcp_agent_mail_db::sync::inbox_event_floor_from_conn(read_db.conn(), project_id, agent_id)
+            .map_err(|error| {
+                CliError::Other(format!("inbox event retention query failed: {error}"))
+            })?;
+    let current_position = mcp_agent_mail_db::sync::inbox_event_position_from_conn(
+        read_db.conn(),
+        project_id,
+        agent_id,
+    )
+    .map_err(|error| CliError::Other(format!("inbox event position failed: {error}")))?
+    .max(floor);
+    validate_inbox_event_cursor(position_now, after, floor, current_position)?;
+
+    if position_now {
+        let output = serde_json::json!({
+            "agent": agent_name,
+            "events": [],
+            "next_cursor": current_position,
+            "has_more": false,
+            "positioned_now": true,
+        });
+        println!("{}", serde_json::to_string(&output)?);
+        return Ok(());
+    }
+
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(wait_seconds))
+        .ok_or_else(|| CliError::InvalidArgument("inbox-events --wait is too large".to_string()))?;
+    let page_with_sentinel = loop {
+        let events = mcp_agent_mail_db::sync::fetch_inbox_events_from_conn(
+            read_db.conn(),
+            project_id,
+            agent_id,
+            after,
+            limit + 1,
+        )
+        .map_err(|error| CliError::Other(format!("inbox event query failed: {error}")))?;
+        if !events.is_empty() || std::time::Instant::now() >= deadline {
+            break events;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let has_more = page_with_sentinel.len() > limit;
+    let page = page_with_sentinel
+        .into_iter()
+        .take(limit)
+        .collect::<Vec<_>>();
+    let next_cursor = page.last().map_or(after, |event| event.seq);
+    let events = page
+        .into_iter()
+        .map(|event| serde_json::json!({"seq": event.seq, "message_id": event.message_id}))
+        .collect::<Vec<_>>();
+    let output = serde_json::json!({
+        "agent": agent_name,
+        "events": events,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "positioned_now": false,
+    });
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+fn validate_inbox_event_cursor(
+    position_now: bool,
+    after: i64,
+    floor: i64,
+    current_position: i64,
+) -> CliResult<()> {
+    if position_now {
+        return Ok(());
+    }
+    if after < floor {
+        return Err(CliError::Other(format!(
+            "cursor_expired: cursor {after} is older than retained floor {floor}; use --position-now only with operator approval"
+        )));
+    }
+    if after > current_position {
+        return Err(CliError::Other(format!(
+            "cursor_ahead: cursor {after} is newer than durable position {current_position}; restore the matching state/database backup or rebaseline with operator approval"
+        )));
+    }
+    Ok(())
+}
+
 /// Handle the check-inbox command.
 ///
 /// Checks the agent inbox for unread messages. Designed for git hooks and editor integrations.
@@ -7382,12 +7558,22 @@ fn handle_check_inbox(
         .or_else(|| std::env::var("AGENT_MAIL_AGENT").ok());
 
     let Some(agent_name) = agent_name else {
-        // No agent configured - exit silently (not an error for hooks)
+        if fmt == output::CliOutputFormat::Json {
+            return Err(CliError::InvalidArgument(
+                "check-inbox requires --agent, AGENT_NAME, or AGENT_MAIL_AGENT".to_string(),
+            ));
+        }
+        // Legacy human/hook mode remains fail-open.
         return Ok(());
     };
 
     // Check for template/placeholder values (exit silently if detected)
     if value_looks_like_template(&agent_name) {
+        if fmt == output::CliOutputFormat::Json {
+            return Err(CliError::InvalidArgument(
+                "check-inbox agent is an unresolved template value".to_string(),
+            ));
+        }
         return Ok(());
     }
 
@@ -7401,6 +7587,11 @@ fn handle_check_inbox(
         });
 
     if value_looks_like_template(&project_key) {
+        if fmt == output::CliOutputFormat::Json {
+            return Err(CliError::InvalidArgument(
+                "check-inbox project is an unresolved template value".to_string(),
+            ));
+        }
         return Ok(());
     }
 
@@ -7465,14 +7656,17 @@ fn handle_check_inbox(
         check_inbox_direct(&config)
     };
 
-    // Handle result - exit silently on any error (fail-safe for hooks)
+    // Machine-readable callers need failures to be distinguishable from an
+    // empty inbox. Preserve legacy fail-open behavior only for human/hook mode.
     let result = match result {
         Ok(r) => r,
-        Err(_) => return Ok(()), // Fail silently
+        Err(error) if fmt == output::CliOutputFormat::Json => return Err(error),
+        Err(_) => return Ok(()),
     };
 
-    // No messages - exit silently
-    if result.unread_count == 0 {
+    // Legacy human/hook mode remains silent for an empty inbox. JSON always
+    // emits the stable object below, including `messages: []`.
+    if result.unread_count == 0 && fmt != output::CliOutputFormat::Json {
         return Ok(());
     }
 
@@ -39245,6 +39439,8 @@ http_headers = { Authorization = "Bearer secret" }
         // GH#207: check-inbox is a non-consuming peek — it must always ask
         // the daemon's fetch_inbox NOT to mark the returned messages read.
         assert_eq!(payload["params"]["arguments"]["mark_read"], false);
+        // Monitoring observes only unread recipient rows on both transports.
+        assert_eq!(payload["params"]["arguments"]["unread_only"], true);
     }
 
     #[test]
@@ -39967,6 +40163,71 @@ http_headers = { Authorization = "Bearer secret" }
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_parses_inbox_event_cursor_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "inbox-events",
+            "--project",
+            "/tmp/project",
+            "--agent",
+            "BlueLake",
+            "--after",
+            "41",
+            "--limit",
+            "250",
+            "--wait",
+            "10",
+            "--json",
+        ])
+        .expect("parse inbox-events");
+        match cli.command.expect("expected command") {
+            Commands::InboxEvents {
+                project,
+                agent,
+                after,
+                limit,
+                wait,
+                position_now,
+                json,
+            } => {
+                assert_eq!(project.as_deref(), Some("/tmp/project"));
+                assert_eq!(agent.as_deref(), Some("BlueLake"));
+                assert_eq!(after, 41);
+                assert_eq!(limit, 250);
+                assert_eq!(wait, 10);
+                assert!(!position_now);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_rejects_excessive_inbox_event_wait() {
+        let error = Cli::try_parse_from(["am", "inbox-events", "--wait", "3601"])
+            .expect_err("waits over one hour must be rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn inbox_event_cursor_rejects_expired_and_ahead_positions() {
+        let expired = validate_inbox_event_cursor(false, 4, 5, 10)
+            .expect_err("cursor below floor must expire")
+            .to_string();
+        assert!(expired.contains("cursor_expired"));
+
+        let ahead = validate_inbox_event_cursor(false, 11, 5, 10)
+            .expect_err("cursor above durable position must fail")
+            .to_string();
+        assert!(ahead.contains("cursor_ahead"));
+
+        validate_inbox_event_cursor(false, 5, 5, 10).expect("floor is inclusive");
+        validate_inbox_event_cursor(false, 10, 5, 10).expect("head is inclusive");
+        validate_inbox_event_cursor(true, 0, 5, 10)
+            .expect("operator-approved position-now bypasses the retention floor");
     }
 
     #[test]
@@ -72492,6 +72753,7 @@ fn build_fetch_inbox_jsonrpc_request(config: &CheckInboxRpcConfig) -> serde_json
                 "agent_name": config.agent_name,
                 "limit": config.limit,
                 "include_bodies": config.include_bodies,
+                "unread_only": true,
                 // check-inbox is a monitoring peek for hooks and editors; it
                 // must never consume unread state (GH#207).
                 "mark_read": false,

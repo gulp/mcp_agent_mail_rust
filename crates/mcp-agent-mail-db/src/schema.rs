@@ -2132,6 +2132,66 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v25: durable recipient delivery cursor ────────────────────────
+    migrations.push(Migration::new(
+        "v25_create_inbox_delivery_events".to_string(),
+        "append-only recipient delivery events for durable inbox cursors".to_string(),
+        "CREATE TABLE IF NOT EXISTS inbox_delivery_events (\
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,\
+            project_id INTEGER NOT NULL CHECK(project_id > 0),\
+            agent_id INTEGER NOT NULL CHECK(agent_id > 0),\
+            message_id INTEGER NOT NULL CHECK(message_id > 0),\
+            created_ts INTEGER NOT NULL,\
+            UNIQUE(agent_id, message_id)\
+        )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v25_backfill_inbox_delivery_events".to_string(),
+        "backfill durable delivery events in message-id order".to_string(),
+        "INSERT OR IGNORE INTO inbox_delivery_events (project_id, agent_id, message_id, created_ts) \
+         SELECT m.project_id, r.agent_id, r.message_id, m.created_ts \
+         FROM message_recipients r JOIN messages m ON m.id = r.message_id \
+         ORDER BY r.message_id, r.agent_id"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v25_idx_inbox_delivery_events_agent_seq".to_string(),
+        "index durable recipient delivery events by project, agent, and cursor".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_inbox_delivery_events_agent_seq \
+         ON inbox_delivery_events(project_id, agent_id, seq)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v25_trg_message_recipients_delivery_event".to_string(),
+        "append a durable event in the recipient insertion transaction".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_message_recipients_delivery_event \
+         AFTER INSERT ON message_recipients \
+         BEGIN \
+             INSERT OR IGNORE INTO inbox_delivery_events \
+                 (project_id, agent_id, message_id, created_ts) \
+             SELECT project_id, NEW.agent_id, NEW.message_id, created_ts \
+             FROM messages WHERE id = NEW.message_id; \
+         END"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v25_create_inbox_event_retention".to_string(),
+        "record the oldest valid cursor after explicit event pruning".to_string(),
+        "CREATE TABLE IF NOT EXISTS inbox_event_retention (\
+            project_id INTEGER NOT NULL,\
+            agent_id INTEGER NOT NULL,\
+            floor_seq INTEGER NOT NULL DEFAULT 0 CHECK(floor_seq >= 0),\
+            PRIMARY KEY(project_id, agent_id)\
+        )"
+        .to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -4082,6 +4142,78 @@ mod tests {
         assert!(
             applied2.is_empty(),
             "second migrate call should be idempotent"
+        );
+    }
+
+    #[test]
+    fn inbox_delivery_event_migration_backfills_and_trigger_rolls_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("inbox_event_backfill.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, created_ts INTEGER NOT NULL)",
+        )
+        .expect("create pre-v25 messages table");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL)",
+        )
+        .expect("create pre-v25 recipients table");
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, created_ts) VALUES (10, 7, 100), (20, 7, 200)",
+            &[],
+        )
+        .expect("insert pre-v25 messages");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (20, 9, 'to'), (10, 9, 'to')",
+            &[],
+        )
+        .expect("insert pre-v25 recipients");
+
+        for migration in schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v25_"))
+        {
+            conn.execute_raw(&migration.up)
+                .unwrap_or_else(|error| panic!("apply {}: {error}", migration.id));
+        }
+
+        let rows = conn
+            .query_sync(
+                "SELECT message_id FROM inbox_delivery_events WHERE project_id = 7 AND agent_id = 9 ORDER BY seq",
+                &[],
+            )
+            .expect("query backfill");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.get_named::<i64>("message_id").expect("message id"))
+                .collect::<Vec<_>>(),
+            vec![10, 20],
+            "backfill must be deterministic and oldest-message-first"
+        );
+
+        conn.execute_raw("BEGIN")
+            .expect("begin recipient transaction");
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, created_ts) VALUES (30, 7, 300)",
+            &[],
+        )
+        .expect("insert transactional message");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (30, 9, 'to')",
+            &[],
+        )
+        .expect("insert transactional recipient");
+        conn.execute_raw("ROLLBACK")
+            .expect("roll back recipient transaction");
+        let rolled_back = conn
+            .query_sync(
+                "SELECT message_id FROM inbox_delivery_events WHERE message_id = 30",
+                &[],
+            )
+            .expect("query rolled-back event");
+        assert!(
+            rolled_back.is_empty(),
+            "event insert must share recipient transaction"
         );
     }
 
