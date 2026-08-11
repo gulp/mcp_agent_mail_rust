@@ -9,6 +9,15 @@ use sqlmodel_schema::{Migration, MigrationRunner, MigrationStatus};
 use std::collections::HashSet;
 use std::time::Duration;
 
+const CREATE_INBOX_DELIVERY_EVENT_TRIGGER_SQL: &str = "CREATE TRIGGER IF NOT EXISTS trg_message_recipients_delivery_event \
+     AFTER INSERT ON message_recipients \
+     BEGIN \
+         INSERT OR IGNORE INTO inbox_delivery_events \
+             (project_id, agent_id, message_id, created_ts) \
+         SELECT project_id, NEW.agent_id, NEW.message_id, created_ts \
+         FROM messages WHERE id = NEW.message_id; \
+     END";
+
 // Schema creation SQL - no runtime dependencies needed
 
 /// SQL statements for creating the database schema
@@ -2168,15 +2177,7 @@ pub fn schema_migrations() -> Vec<Migration> {
     migrations.push(Migration::new(
         "v25_trg_message_recipients_delivery_event".to_string(),
         "append a durable event in the recipient insertion transaction".to_string(),
-        "CREATE TRIGGER IF NOT EXISTS trg_message_recipients_delivery_event \
-         AFTER INSERT ON message_recipients \
-         BEGIN \
-             INSERT OR IGNORE INTO inbox_delivery_events \
-                 (project_id, agent_id, message_id, created_ts) \
-             SELECT project_id, NEW.agent_id, NEW.message_id, created_ts \
-             FROM messages WHERE id = NEW.message_id; \
-         END"
-        .to_string(),
+        CREATE_INBOX_DELIVERY_EVENT_TRIGGER_SQL.to_string(),
         String::new(),
     ));
     migrations.push(Migration::new(
@@ -3231,7 +3232,7 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
     cx: &Cx,
     conn: &C,
 ) -> Outcome<(), SqlError> {
-    const REBUILD_SQL: [&str; 24] = [
+    const REBUILD_SQL: [&str; 25] = [
         "DROP TRIGGER IF EXISTS fts_messages_ai",
         "DROP TRIGGER IF EXISTS fts_messages_ad",
         "DROP TRIGGER IF EXISTS fts_messages_au",
@@ -3242,6 +3243,7 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         "DROP TRIGGER IF EXISTS trg_inbox_stats_mark_read",
         "DROP TRIGGER IF EXISTS trg_inbox_stats_ack",
         "DROP TRIGGER IF EXISTS trg_messages_default_recipients_json",
+        "DROP TRIGGER IF EXISTS trg_message_recipients_delivery_event",
         "DROP TABLE IF EXISTS messages_v15_rebuild",
         "CREATE TABLE messages_v15_rebuild (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -3281,6 +3283,32 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
 
     for sql in REBUILD_SQL {
         match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    let event_table_exists = match conn
+        .query(
+            cx,
+            "SELECT 1 AS present FROM sqlite_master \
+             WHERE type = 'table' AND name = 'inbox_delivery_events' LIMIT 1",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => !rows.is_empty(),
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if event_table_exists {
+        match conn
+            .execute(cx, CREATE_INBOX_DELIVERY_EVENT_TRIGGER_SQL, &[])
+            .await
+        {
             Outcome::Ok(_) => {}
             Outcome::Err(err) => return Outcome::Err(err),
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),

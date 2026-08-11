@@ -12023,6 +12023,66 @@ mod tests {
             "{}",
             "normal pool startup should backfill recipients_json for legacy rows"
         );
+        let delivery_trigger = verify_conn
+            .query_sync(
+                "SELECT COUNT(*) AS n FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'trg_message_recipients_delivery_event'",
+                &[],
+            )
+            .expect("query delivery trigger");
+        assert_eq!(
+            delivery_trigger[0]
+                .get_named::<i64>("n")
+                .expect("delivery trigger count"),
+            1,
+            "the v15 messages rebuild must restore the v25 delivery trigger"
+        );
+        let backfilled_event = verify_conn
+            .query_sync(
+                "SELECT COUNT(*) AS n FROM inbox_delivery_events \
+                 WHERE project_id = 1 AND agent_id = 2 AND message_id = 1",
+                &[],
+            )
+            .expect("query legacy delivery event");
+        assert_eq!(
+            backfilled_event[0]
+                .get_named::<i64>("n")
+                .expect("legacy event count"),
+            1,
+            "legacy recipient must be represented in the durable event stream"
+        );
+        verify_conn
+            .execute_sync(
+                "INSERT INTO messages \
+                 (id, project_id, sender_id, thread_id, subject, body_md, importance, \
+                  ack_required, created_ts, recipients_json, attachments) \
+                 VALUES (2, 1, 1, 'br-28mgh.8.3', 'Post-migration message', 'body', \
+                         'normal', 0, 1771950000000000, '{}', '[]')",
+                &[],
+            )
+            .expect("insert post-migration message");
+        verify_conn
+            .execute_sync(
+                "INSERT INTO message_recipients \
+                 (message_id, agent_id, kind, read_ts, ack_ts) \
+                 VALUES (2, 2, 'to', NULL, NULL)",
+                &[],
+            )
+            .expect("insert post-migration recipient");
+        let live_event = verify_conn
+            .query_sync(
+                "SELECT COUNT(*) AS n FROM inbox_delivery_events \
+                 WHERE project_id = 1 AND agent_id = 2 AND message_id = 2",
+                &[],
+            )
+            .expect("query post-migration delivery event");
+        assert_eq!(
+            live_event[0]
+                .get_named::<i64>("n")
+                .expect("post-migration event count"),
+            1,
+            "restored trigger must capture recipients inserted after migration"
+        );
     }
 
     #[test]
