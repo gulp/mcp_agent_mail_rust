@@ -39519,6 +39519,87 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn inbox_events_response_validation_accepts_empty_and_paginated_pages() {
+        let empty = serde_json::json!({
+            "agent": "BlueLake",
+            "events": [],
+            "next_cursor": 41,
+            "has_more": false,
+            "positioned_now": false,
+        });
+        validate_inbox_events_output(empty, "BlueLake", 41, 2, false)
+            .expect("empty page at the requested cursor");
+
+        let full = serde_json::json!({
+            "agent": "BlueLake",
+            "events": [
+                {"seq": 42, "message_id": 100},
+                {"seq": 44, "message_id": 101}
+            ],
+            "next_cursor": 44,
+            "has_more": true,
+            "positioned_now": false,
+        });
+        validate_inbox_events_output(full, "BlueLake", 41, 2, false)
+            .expect("full page with a continuation");
+
+        let positioned = serde_json::json!({
+            "agent": "BlueLake",
+            "events": [],
+            "next_cursor": 99,
+            "has_more": false,
+            "positioned_now": true,
+        });
+        validate_inbox_events_output(positioned, "BlueLake", 0, 2, true)
+            .expect("position-now response");
+    }
+
+    #[test]
+    fn inbox_events_response_validation_rejects_contract_violations() {
+        let cases = [
+            serde_json::json!({
+                "agent": "Other",
+                "events": [],
+                "next_cursor": 41,
+                "has_more": false,
+                "positioned_now": false,
+            }),
+            serde_json::json!({
+                "agent": "BlueLake",
+                "events": [{"seq": 42, "message_id": 100}, {"seq": 42, "message_id": 101}],
+                "next_cursor": 42,
+                "has_more": false,
+                "positioned_now": false,
+            }),
+            serde_json::json!({
+                "agent": "BlueLake",
+                "events": [{"seq": 42, "message_id": 0}],
+                "next_cursor": 42,
+                "has_more": false,
+                "positioned_now": false,
+            }),
+            serde_json::json!({
+                "agent": "BlueLake",
+                "events": [{"seq": 42, "message_id": 100}],
+                "next_cursor": 43,
+                "has_more": false,
+                "positioned_now": false,
+            }),
+            serde_json::json!({
+                "agent": "BlueLake",
+                "events": [{"seq": 42, "message_id": 100}],
+                "next_cursor": 42,
+                "has_more": true,
+                "positioned_now": false,
+            }),
+        ];
+        for invalid in cases {
+            validate_inbox_events_output(invalid, "BlueLake", 41, 2, false)
+                .expect_err("invalid daemon response must fail closed");
+        }
+    }
+
+    #[test]
     fn parse_fetch_inbox_rows_supports_array_and_result_wrapped_shapes() {
         let direct = serde_json::json!([
             {
@@ -73791,7 +73872,19 @@ async fn inbox_events_via_jsonrpc(
             continue;
         };
         if let Some(result) = coerce_tool_result_json(result) {
-            return Ok(result);
+            match validate_inbox_events_output(
+                result,
+                &config.agent_name,
+                after,
+                limit,
+                position_now,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            }
         }
         last_error = Some(CliError::Other(
             "unexpected inbox_events response shape".to_string(),
@@ -73799,6 +73892,90 @@ async fn inbox_events_via_jsonrpc(
     }
     Err(last_error
         .unwrap_or_else(|| CliError::Other("no Agent Mail server URLs configured".to_string())))
+}
+
+fn validate_inbox_events_output(
+    output: serde_json::Value,
+    expected_agent: &str,
+    after: i64,
+    limit: usize,
+    position_now: bool,
+) -> CliResult<serde_json::Value> {
+    let object = output.as_object().ok_or_else(|| {
+        CliError::Other("unexpected inbox_events response shape: expected object".to_string())
+    })?;
+    if object.get("agent").and_then(serde_json::Value::as_str) != Some(expected_agent) {
+        return Err(CliError::Other(
+            "unexpected inbox_events response shape: agent mismatch".to_string(),
+        ));
+    }
+    if object
+        .get("positioned_now")
+        .and_then(serde_json::Value::as_bool)
+        != Some(position_now)
+    {
+        return Err(CliError::Other(
+            "unexpected inbox_events response shape: positioned_now mismatch".to_string(),
+        ));
+    }
+    let events = object
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            CliError::Other(
+                "unexpected inbox_events response shape: events must be an array".to_string(),
+            )
+        })?;
+    if events.len() > limit || (position_now && !events.is_empty()) {
+        return Err(CliError::Other(
+            "unexpected inbox_events response shape: invalid event count".to_string(),
+        ));
+    }
+    let mut previous = after;
+    for event in events {
+        let seq = event.get("seq").and_then(serde_json::Value::as_i64);
+        let message_id = event.get("message_id").and_then(serde_json::Value::as_i64);
+        if seq.is_none_or(|seq| seq <= previous) || message_id.is_none_or(|id| id <= 0) {
+            return Err(CliError::Other(
+                "unexpected inbox_events response shape: invalid event cursor or message ID"
+                    .to_string(),
+            ));
+        }
+        previous = seq.expect("validated event sequence");
+    }
+    let next_cursor = object
+        .get("next_cursor")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            CliError::Other(
+                "unexpected inbox_events response shape: next_cursor must be an integer"
+                    .to_string(),
+            )
+        })?;
+    let expected_cursor = if position_now {
+        next_cursor
+    } else {
+        events.last().map_or(after, |_| previous)
+    };
+    if next_cursor < 0 || next_cursor != expected_cursor {
+        return Err(CliError::Other(
+            "unexpected inbox_events response shape: next_cursor mismatch".to_string(),
+        ));
+    }
+    let has_more = object
+        .get("has_more")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            CliError::Other(
+                "unexpected inbox_events response shape: has_more must be boolean".to_string(),
+            )
+        })?;
+    if position_now && has_more || has_more && events.len() != limit {
+        return Err(CliError::Other(
+            "unexpected inbox_events response shape: invalid has_more contract".to_string(),
+        ));
+    }
+    Ok(output)
 }
 
 async fn fetch_inbox_via_jsonrpc_with_fallback(
