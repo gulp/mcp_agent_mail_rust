@@ -7467,7 +7467,7 @@ fn handle_inbox_events(
             "has_more": false,
             "positioned_now": true,
         });
-        println!("{}", serde_json::to_string(&output)?);
+        println!("{output}");
         return Ok(());
     }
 
@@ -7505,7 +7505,7 @@ fn handle_inbox_events(
         "has_more": has_more,
         "positioned_now": false,
     });
-    println!("{}", serde_json::to_string(&output)?);
+    println!("{output}");
     Ok(())
 }
 
