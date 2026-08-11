@@ -2824,6 +2824,22 @@ pub enum DoctorCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum AgentsCommand {
+    /// Resolve the canonical agent identity for a tmux pane without reading mail.
+    #[command(name = "resolve-pane")]
+    ResolvePane {
+        /// Project key (normally an absolute project path).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Tmux or Herdr pane identifier (for example `%3` or `wB:pQ`).
+        #[arg(long)]
+        pane: String,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Register or update an agent identity in a project (idempotent).
     Register {
         /// Project key (slug or human_key / absolute path).
@@ -3427,7 +3443,10 @@ fn command_is_read_only(command: &Commands) -> bool {
 fn agents_command_is_read_only(action: &AgentsCommand) -> bool {
     matches!(
         action,
-        AgentsCommand::List { .. } | AgentsCommand::Show { .. } | AgentsCommand::Detect { .. }
+        AgentsCommand::ResolvePane { .. }
+            | AgentsCommand::List { .. }
+            | AgentsCommand::Show { .. }
+            | AgentsCommand::Detect { .. }
     )
 }
 
@@ -33522,6 +33541,65 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
 
     match action {
+        AgentsCommand::ResolvePane {
+            project_key,
+            pane,
+            format,
+            json,
+        } => {
+            let project_key = project_key.trim();
+            if project_key.is_empty() {
+                return Err(CliError::InvalidArgument("project cannot be empty".into()));
+            }
+            let pane = pane.trim();
+            if pane.is_empty() {
+                return Err(CliError::InvalidArgument("pane cannot be empty".into()));
+            }
+            let Some((agent_name, identity_path)) =
+                mcp_agent_mail_core::resolve_identity_with_path(project_key, pane)
+            else {
+                let checked = mcp_agent_mail_core::canonical_identity_path(project_key, pane);
+                return Err(CliError::InvalidArgument(format!(
+                    "no identity found for pane '{pane}' in project '{project_key}'; checked {}. \
+                     Register an identity with `am agents register --project {project_key} \
+                     --program codex-cli --model <MODEL> --name <AGENT> --json`, then retry \
+                     `am agents resolve-pane --project {project_key} --pane {pane} --json`.",
+                    checked.display()
+                )));
+            };
+            let canonical = mcp_agent_mail_core::canonical_identity_path(project_key, pane);
+            let source = if identity_path == canonical {
+                "canonical"
+            } else if identity_path
+                .to_string_lossy()
+                .contains("/.claude/agent-mail/")
+            {
+                "legacy-claude"
+            } else if identity_path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("agent-mail-name."))
+            {
+                "legacy-ntm"
+            } else {
+                "canonical-compatible"
+            };
+            let payload = serde_json::json!({
+                "schema_version": "am.agents.resolve-pane.v1",
+                "agent_name": agent_name,
+                "pane_id": pane,
+                "project_key": project_key,
+                "source": source,
+            });
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            output::emit_output(&payload, fmt, || {
+                output::section("Pane identity");
+                output::kv("Agent", payload["agent_name"].as_str().unwrap_or_default());
+                output::kv("Pane", pane);
+                output::kv("Project", project_key);
+                output::kv("Source", source);
+            });
+            Ok(())
+        }
         AgentsCommand::Register {
             project_key,
             program,
@@ -56546,6 +56624,38 @@ startup_timeout_sec = 42
             } => {
                 assert_eq!(only.as_deref(), Some("claude,codex"));
                 assert!(include_undetected);
+                assert!(format.is_none());
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_agents_resolve_pane_json() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "agents",
+            "resolve-pane",
+            "--project",
+            "/home/me/project",
+            "--pane",
+            "wB:pQ",
+            "--json",
+        ])
+        .expect("failed to parse agents resolve-pane");
+        match cli.command.expect("expected command") {
+            Commands::Agents {
+                action:
+                    AgentsCommand::ResolvePane {
+                        project_key,
+                        pane,
+                        format,
+                        json,
+                    },
+            } => {
+                assert_eq!(project_key, "/home/me/project");
+                assert_eq!(pane, "wB:pQ");
                 assert!(format.is_none());
                 assert!(json);
             }
