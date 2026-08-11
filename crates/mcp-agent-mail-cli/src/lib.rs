@@ -593,6 +593,15 @@ pub enum Commands {
         /// Return the current recipient position without historical events.
         #[arg(long, conflicts_with = "after")]
         position_now: bool,
+        /// Read SQLite directly instead of routing through the running daemon.
+        #[arg(long)]
+        direct: bool,
+        /// Server host for daemon mode (default: 127.0.0.1).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Server port for daemon mode (default: 8765).
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
         /// Emit machine-readable JSON.
         #[arg(long, default_value_t = true)]
         json: bool,
@@ -3634,7 +3643,21 @@ fn execute(cli: Cli) -> CliResult<()> {
             wait,
             json,
             position_now,
-        } => handle_inbox_events(agent, project, after, limit, wait, position_now, json),
+            direct,
+            host,
+            port,
+        } => handle_inbox_events(
+            agent,
+            project,
+            after,
+            limit,
+            wait,
+            position_now,
+            direct,
+            host,
+            port,
+            json,
+        ),
         Commands::Check {
             quick,
             report,
@@ -7405,6 +7428,9 @@ fn handle_inbox_events(
     limit: usize,
     wait_seconds: u64,
     position_now: bool,
+    direct: bool,
+    host: String,
+    port: u16,
     json: bool,
 ) -> CliResult<()> {
     let after = after.unwrap_or(0);
@@ -7439,6 +7465,37 @@ fn handle_inbox_events(
                 .map(|path| path.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default()
         });
+
+    if !direct {
+        let base_config = Config::from_env();
+        let mut rpc_config = resolve_check_inbox_rpc_config_reader(
+            |key| std::env::var(key).ok(),
+            &project_key,
+            &agent_name,
+            &host,
+            port,
+            &base_config.http_path,
+        );
+        rpc_config.timeout_seconds = CHECK_INBOX_RPC_TIMEOUT_SECS.max(5);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|error| CliError::Other(format!("runtime error: {error}")))?;
+        let mut output = runtime.block_on(async {
+            inbox_events_via_jsonrpc(&rpc_config, after, limit, position_now).await
+        })?;
+        let empty = output
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if empty && !position_now && wait_seconds > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(wait_seconds));
+            output = runtime.block_on(async {
+                inbox_events_via_jsonrpc(&rpc_config, after, limit, false).await
+            })?;
+        }
+        println!("{output}");
+        return Ok(());
+    }
 
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
     let read_db = open_db_sync_mail_inbox_with_database_url_and_path(&database_url)?;
@@ -39440,6 +39497,28 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn build_inbox_events_request_uses_daemon_tool_shape() {
+        let cfg = CheckInboxRpcConfig {
+            server_url: "http://127.0.0.1:8765/api/".to_string(),
+            server_urls: vec!["http://127.0.0.1:8765/api/".to_string()],
+            bearer_token: None,
+            project_key: "/tmp/proj".to_string(),
+            agent_name: "BlueLake".to_string(),
+            limit: 10,
+            include_bodies: false,
+            timeout_seconds: 3,
+        };
+        let payload = build_inbox_events_jsonrpc_request(&cfg, 41, 250, false);
+        assert_eq!(payload["method"], "tools/call");
+        assert_eq!(payload["params"]["name"], "inbox_events");
+        assert_eq!(payload["params"]["arguments"]["project_key"], "/tmp/proj");
+        assert_eq!(payload["params"]["arguments"]["agent_name"], "BlueLake");
+        assert_eq!(payload["params"]["arguments"]["after"], 41);
+        assert_eq!(payload["params"]["arguments"]["limit"], 250);
+        assert_eq!(payload["params"]["arguments"]["position_now"], false);
+    }
+
+    #[test]
     fn parse_fetch_inbox_rows_supports_array_and_result_wrapped_shapes() {
         let direct = serde_json::json!([
             {
@@ -40187,6 +40266,9 @@ http_headers = { Authorization = "Bearer secret" }
                 limit,
                 wait,
                 position_now,
+                direct,
+                host,
+                port,
                 json,
             } => {
                 assert_eq!(project.as_deref(), Some("/tmp/project"));
@@ -40195,6 +40277,9 @@ http_headers = { Authorization = "Bearer secret" }
                 assert_eq!(limit, 250);
                 assert_eq!(wait, 10);
                 assert!(!position_now);
+                assert!(!direct);
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 8765);
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -72765,6 +72850,29 @@ fn build_fetch_inbox_jsonrpc_request(config: &CheckInboxRpcConfig) -> serde_json
     })
 }
 
+fn build_inbox_events_jsonrpc_request(
+    config: &CheckInboxRpcConfig,
+    after: i64,
+    limit: usize,
+    position_now: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "tools/call",
+        "params": {
+            "name": "inbox_events",
+            "arguments": {
+                "project_key": config.project_key,
+                "agent_name": config.agent_name,
+                "after": after,
+                "limit": limit,
+                "position_now": position_now,
+            }
+        }
+    })
+}
+
 fn parse_jsonrpc_error(payload: &serde_json::Value) -> Option<String> {
     let err = payload.get("error")?;
     let code = err.get("code").and_then(serde_json::Value::as_i64);
@@ -73639,6 +73747,58 @@ pub async fn fetch_inbox_via_jsonrpc(
     Err(last_error.unwrap_or_else(|| {
         CliError::Other("no server URLs configured for check-inbox HTTP mode".to_string())
     }))
+}
+
+async fn inbox_events_via_jsonrpc(
+    config: &CheckInboxRpcConfig,
+    after: i64,
+    limit: usize,
+    position_now: bool,
+) -> CliResult<serde_json::Value> {
+    let mut urls = Vec::with_capacity(config.server_urls.len() + 1);
+    urls.push(config.server_url.clone());
+    for url in &config.server_urls {
+        if !urls.iter().any(|existing| existing == url) {
+            urls.push(url.clone());
+        }
+    }
+
+    let request = build_inbox_events_jsonrpc_request(config, after, limit, position_now);
+    let mut last_error = None;
+    for server_url in urls {
+        let payload = match post_jsonrpc_request(
+            &server_url,
+            config.bearer_token.as_deref(),
+            &request,
+            config.timeout_seconds,
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        if let Some(error) = parse_jsonrpc_error(&payload) {
+            last_error = Some(CliError::Other(error));
+            continue;
+        }
+        let Some(result) = payload.get("result").cloned() else {
+            last_error = Some(CliError::Other(
+                "missing JSON-RPC result payload".to_string(),
+            ));
+            continue;
+        };
+        if let Some(result) = coerce_tool_result_json(result) {
+            return Ok(result);
+        }
+        last_error = Some(CliError::Other(
+            "unexpected inbox_events response shape".to_string(),
+        ));
+    }
+    Err(last_error
+        .unwrap_or_else(|| CliError::Other("no Agent Mail server URLs configured".to_string())))
 }
 
 async fn fetch_inbox_via_jsonrpc_with_fallback(

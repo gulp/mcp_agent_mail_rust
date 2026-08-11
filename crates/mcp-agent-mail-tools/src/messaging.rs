@@ -4,6 +4,7 @@
 //! - `send_message`: Send a message to recipients
 //! - `reply_message`: Reply to an existing message
 //! - `fetch_inbox`: Retrieve inbox messages
+//! - `inbox_events`: Read the durable non-consuming recipient delivery cursor
 //! - `mark_message_read`: Mark message as read
 //! - `acknowledge_message`: Acknowledge a message
 
@@ -30,6 +31,145 @@ use crate::tool_util::{
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
 const FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US: i64 = 30 * 60 * 1_000_000;
+
+/// Read a non-consuming page from an agent's durable recipient delivery stream.
+///
+/// This tool intentionally does not long-poll. Long waits remain client-side so
+/// an empty inbox never occupies a daemon blocking-work permit.
+#[tool(
+    description = "Read durable recipient delivery events after a monotonic cursor without changing unread or acknowledgement state. Events are oldest-first and body-free. Use position_now=true only to establish an explicitly authorized fresh position."
+)]
+pub async fn inbox_events(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    after: Option<i64>,
+    limit: Option<i32>,
+    position_now: Option<bool>,
+) -> McpResult<String> {
+    let after = after.unwrap_or(0);
+    let position_now = position_now.unwrap_or(false);
+    if after < 0 {
+        return Err(legacy_tool_error(
+            "INVALID_CURSOR",
+            "after must be non-negative".to_string(),
+            true,
+            json!({"after": after}),
+        ));
+    }
+    let limit = limit.unwrap_or(100);
+    if !(1..=1000).contains(&limit) {
+        return Err(legacy_tool_error(
+            "INVALID_LIMIT",
+            "limit must be between 1 and 1000".to_string(),
+            true,
+            json!({"limit": limit, "min": 1, "max": 1000}),
+        ));
+    }
+    if position_now && after != 0 {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "position_now cannot be combined with a nonzero after cursor".to_string(),
+            true,
+            json!({"after": after}),
+        ));
+    }
+
+    let agent_name = normalize_agent_name_or_original(agent_name);
+    let read_pool = get_read_db_pool(ctx.cx()).await?;
+    let project = resolve_project(ctx, &read_pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent = resolve_agent(
+        ctx,
+        &read_pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
+    let agent_id = agent.id.unwrap_or(0);
+
+    let floor = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::inbox_event_floor(ctx.cx(), &read_pool, project_id, agent_id)
+            .await,
+    )?;
+    let position = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::inbox_event_position(
+            ctx.cx(),
+            &read_pool,
+            project_id,
+            agent_id,
+        )
+        .await,
+    )?
+    .max(floor);
+
+    if !position_now && after < floor {
+        return Err(legacy_tool_error(
+            "CURSOR_EXPIRED",
+            format!("cursor {after} is older than retained floor {floor}"),
+            false,
+            json!({"after": after, "floor": floor}),
+        ));
+    }
+    if !position_now && after > position {
+        return Err(legacy_tool_error(
+            "CURSOR_AHEAD",
+            format!("cursor {after} is newer than durable position {position}"),
+            false,
+            json!({"after": after, "position": position}),
+        ));
+    }
+    if position_now {
+        return serde_json::to_string(&json!({
+            "agent": agent_name,
+            "events": [],
+            "next_cursor": position,
+            "has_more": false,
+            "positioned_now": true,
+        }))
+        .map_err(|error| McpError::new(McpErrorCode::InternalError, error.to_string()));
+    }
+
+    let page_limit = usize::try_from(limit).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_LIMIT",
+            "limit exceeds supported range".to_string(),
+            true,
+            json!({"limit": limit}),
+        )
+    })?;
+    let page_with_sentinel = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::fetch_inbox_events(
+            ctx.cx(),
+            &read_pool,
+            project_id,
+            agent_id,
+            after,
+            page_limit + 1,
+        )
+        .await,
+    )?;
+    let has_more = page_with_sentinel.len() > page_limit;
+    let page = page_with_sentinel
+        .into_iter()
+        .take(page_limit)
+        .collect::<Vec<_>>();
+    let next_cursor = page.last().map_or(after, |event| event.seq);
+    let events = page
+        .into_iter()
+        .map(|event| json!({"seq": event.seq, "message_id": event.message_id}))
+        .collect::<Vec<_>>();
+    serde_json::to_string(&json!({
+        "agent": agent_name,
+        "events": events,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "positioned_now": false,
+    }))
+    .map_err(|error| McpError::new(McpErrorCode::InternalError, error.to_string()))
+}
 
 fn emit_tail_latency_evidence(ledger: &TailLatencyPhaseLedger) {
     if let Err(error) = append_tail_latency_evidence_if_configured(ledger) {

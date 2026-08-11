@@ -6959,6 +6959,66 @@ pub struct InboxRow {
     pub ack_ts: Option<i64>,
 }
 
+/// Read a page from the durable recipient delivery stream using a pooled
+/// server-owned connection.
+pub async fn fetch_inbox_events(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    after: i64,
+    limit: usize,
+) -> Outcome<Vec<crate::sync::InboxDeliveryEvent>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    match crate::sync::fetch_inbox_events_from_conn(&conn, project_id, agent_id, after, limit) {
+        Ok(events) => Outcome::Ok(events),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
+/// Return the newest durable recipient delivery position.
+pub async fn inbox_event_position(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+) -> Outcome<i64, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    match crate::sync::inbox_event_position_from_conn(&conn, project_id, agent_id) {
+        Ok(position) => Outcome::Ok(position),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
+/// Return the oldest still-valid durable recipient cursor.
+pub async fn inbox_event_floor(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+) -> Outcome<i64, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    match crate::sync::inbox_event_floor_from_conn(&conn, project_id, agent_id) {
+        Ok(floor) => Outcome::Ok(floor),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn fetch_inbox(
     cx: &Cx,

@@ -229,6 +229,13 @@ pub const TOOL_META_MAP: &[(&str, ToolMeta)] = &[
         },
     ),
     (
+        "inbox_events",
+        ToolMeta {
+            capabilities: &["messaging", "read"],
+            complexity: "low",
+        },
+    ),
+    (
         "mark_message_read",
         ToolMeta {
             capabilities: &["messaging", "read"],

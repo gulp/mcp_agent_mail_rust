@@ -1089,6 +1089,7 @@ pub struct ProjectWithIdentityResponse {
 pub const DEFAULT_AGENT_CAPABILITIES: &[&str] = &[
     "send_message",
     "fetch_inbox",
+    "inbox_events",
     "file_reservation_paths",
     "acknowledge_message",
 ];
